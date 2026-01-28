@@ -218,22 +218,22 @@ class StrawberryDetector:
                       output_folder: Optional[Union[str, Path]] = None,
                       conf_threshold: float = 0.25,
                       visualize: bool = False,
+                      save_full: bool = False,
                       extensions: tuple = (".jpg", ".jpeg", ".png", ".bmp", ".webp")) -> list:
         """
         Detect strawberries in all images in a folder.
         
         Args:
             folder_path: Path to folder containing images
-            output_folder: Path to save JSON results (optional)
+            output_folder: Path to save results (optional)
             conf_threshold: Confidence threshold
             visualize: If True, save visualization images
+            save_full: If True, save masks and depth maps as .npy files
             extensions: Image file extensions to process
         
         Returns:
             List of detection results for all images
         """
-        import os
-        
         folder_path = Path(folder_path)
         if not folder_path.exists():
             raise ValueError(f"Folder not found: {folder_path}")
@@ -258,21 +258,31 @@ class StrawberryDetector:
             print(f"\n🖼️ Processing [{i+1}/{len(image_files)}]: {img_path.name}")
             
             try:
-                if visualize and output_folder:
+                if save_full and output_folder:
+                    # Save full output including masks and depth
+                    result = self.detect_and_save_full(
+                        img_path,
+                        output_dir=output_folder,
+                        conf_threshold=conf_threshold,
+                        save_visualization=visualize
+                    )
+                elif visualize and output_folder:
                     vis_path = output_folder / f"{img_path.stem}_vis.jpg"
                     result, _ = self.detect_and_visualize(
                         img_path,
                         output_image_path=vis_path,
                         conf_threshold=conf_threshold
                     )
-                else:
-                    result = self.detect(img_path, conf_threshold=conf_threshold)
-                
-                # Save individual JSON if output folder specified
-                if output_folder:
+                    # Save JSON
                     json_path = output_folder / f"{img_path.stem}.json"
                     with open(json_path, "w", encoding="utf-8") as f:
                         json.dump(result, f, indent=2, ensure_ascii=False)
+                else:
+                    result = self.detect(img_path, conf_threshold=conf_threshold)
+                    if output_folder:
+                        json_path = output_folder / f"{img_path.stem}.json"
+                        with open(json_path, "w", encoding="utf-8") as f:
+                            json.dump(result, f, indent=2, ensure_ascii=False)
                 
                 results.append(result)
                 print(f"   Found {result['detections_count']} strawberries")
@@ -313,6 +323,125 @@ class StrawberryDetector:
         del result["_numpy"]
         
         return result, vis
+    
+    def detect_and_save_full(self,
+                             image: Union[str, Path, np.ndarray],
+                             output_dir: Union[str, Path],
+                             name_prefix: Optional[str] = None,
+                             conf_threshold: float = 0.25,
+                             save_visualization: bool = True) -> dict:
+        """
+        Detect and save full results including masks and depth maps.
+        
+        Saves:
+            - {prefix}.json: Detection results
+            - {prefix}_depth.npy: Full depth map
+            - {prefix}_vis.jpg: Visualization (if enabled)
+            - {prefix}_mask_{id}.npy: Individual mask for each detection
+            - {prefix}_masks_combined.npy: All masks combined
+        
+        Args:
+            image: Input image path, URL, or numpy array
+            output_dir: Directory to save outputs
+            name_prefix: Prefix for output files (uses image filename if None)
+            conf_threshold: Confidence threshold
+            save_visualization: Whether to save visualization image
+        
+        Returns:
+            Detection result dict with file paths
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Determine prefix
+        if name_prefix is None:
+            if isinstance(image, (str, Path)):
+                name_prefix = Path(image).stem
+            else:
+                name_prefix = "detection"
+        
+        # Load image
+        img = load_image(image)
+        h, w = img.shape[:2]
+        
+        # Run depth estimation
+        depth_map = self.depth_estimator.estimate(img)
+        if depth_map.shape != (h, w):
+            depth_map = cv2.resize(depth_map, (w, h), interpolation=cv2.INTER_LINEAR)
+        
+        # Run segmentation (get raw detections with masks)
+        detections = self.segmenter.segment(img, conf_threshold=conf_threshold)
+        
+        # Save depth map
+        depth_path = output_dir / f"{name_prefix}_depth.npy"
+        np.save(depth_path, depth_map)
+        
+        # Process masks and add depth info
+        masks_combined = np.zeros((h, w), dtype=np.uint8)
+        mask_paths = []
+        
+        for det in detections:
+            det_id = det["id"]
+            self._add_depth_info(det, depth_map)
+            
+            # Save individual mask if available
+            if "mask" in det and "binary_mask" in det["mask"]:
+                mask = det["mask"]["binary_mask"]
+                # Resize mask to original size if needed
+                if mask.shape != (h, w):
+                    mask = cv2.resize(mask.astype(np.float32), (w, h), 
+                                     interpolation=cv2.INTER_NEAREST)
+                
+                mask_uint8 = (mask > 0.5).astype(np.uint8) * 255
+                mask_path = output_dir / f"{name_prefix}_mask_{det_id}.npy"
+                np.save(mask_path, mask_uint8)
+                mask_paths.append(str(mask_path))
+                
+                # Add to combined mask (with unique ID)
+                masks_combined[mask > 0.5] = det_id + 1
+        
+        # Save combined masks
+        combined_mask_path = output_dir / f"{name_prefix}_masks_combined.npy"
+        np.save(combined_mask_path, masks_combined)
+        
+        # Remove binary masks from detections (not JSON serializable)
+        for det in detections:
+            if "mask" in det and "binary_mask" in det["mask"]:
+                del det["mask"]["binary_mask"]
+        
+        # Compute statistics
+        stats = self._compute_statistics(detections)
+        
+        # Build result
+        result = {
+            "image_path": str(image) if isinstance(image, (str, Path)) else "<numpy array>",
+            "image_size": {"width": w, "height": h},
+            "depth_map_shape": list(depth_map.shape),
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "detections_count": len(detections),
+            "detections": detections,
+            "statistics": stats,
+            "output_files": {
+                "depth_map": str(depth_path),
+                "masks_combined": str(combined_mask_path),
+                "individual_masks": mask_paths,
+            }
+        }
+        
+        # Save visualization
+        if save_visualization:
+            vis = visualize_results(img, detections, depth_map)
+            vis_path = output_dir / f"{name_prefix}_vis.jpg"
+            cv2.imwrite(str(vis_path), vis)
+            result["output_files"]["visualization"] = str(vis_path)
+        
+        # Save JSON
+        json_path = output_dir / f"{name_prefix}.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2, ensure_ascii=False)
+        result["output_files"]["json"] = str(json_path)
+        
+        return result
 
 
 # Convenience function for quick detection
